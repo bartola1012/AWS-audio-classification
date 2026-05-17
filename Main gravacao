@@ -1,0 +1,112 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/i2s_std.h"
+#include "esp_log.h"
+#include "driver/uart.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+
+static const char *TAG = "MIC_I2S";
+
+// --- CONFIGURAÇÃO DOS PINOS ---
+#define I2S_WS_PIN  15  // Word Select (L/R Clock)
+#define I2S_SCK_PIN 14  // Serial Clock (BCLK)
+#define I2S_SD_PIN  32  // Serial Data (DIN - Saída do Microfone)
+
+// Pino do botão para acordar do Deep Sleep
+#define BUTTON_GPIO GPIO_NUM_33 
+
+// Configurações de tempo e taxa de amostragem
+#define SAMPLE_RATE 20000 
+#define RECORD_TIME_SEC 4 
+
+i2s_chan_handle_t rx_chan; 
+
+void i2s_init() {
+    // 1. Configuração do canal (Modo Master, Auto Numeração)
+    i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, NULL, &rx_chan));
+
+    // 2. Configuração do protocolo padrão (I2S Philips)
+    i2s_std_config_t rx_std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_SCK_PIN,
+            .ws   = I2S_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = I2S_SD_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+
+    // 3. Aplica as configurações e liga o microfone
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_chan, &rx_std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_chan));
+    
+    ESP_LOGI(TAG, "Microfone I2S Inicializado com Sucesso!");
+}
+
+void app_main(void) {
+    // 1. Verifica se acordou pelo botão ou se acabou de ser ligado na tomada
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+    if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+        ESP_LOGI(TAG, "Botão pressionado! Gravando %d segundos...", RECORD_TIME_SEC);
+        
+        // Inicializa I2S e UART apenas quando for gravar
+        i2s_init();
+        uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
+        uart_set_baudrate(UART_NUM_0, 921600);
+        
+        // Tempo crucial de estabilização do hardware após o boot para evitar estalos
+        vTaskDelay(pdMS_TO_TICKS(150)); 
+        
+        // Marcador binário para sincronizar perfeitamente com o script Python
+        const char marker[16] = "===START_AUDIO==";
+        uart_write_bytes(UART_NUM_0, marker, 16);
+
+        size_t bytes_read;
+        int32_t sample; 
+        
+        // Cálculo exato de amostras (20000 * 4 = 80000 iterações do loop)
+        uint32_t total_samples = SAMPLE_RATE * RECORD_TIME_SEC;
+
+        for (uint32_t i = 0; i < total_samples; i++) {
+            if (i2s_channel_read(rx_chan, &sample, sizeof(sample), &bytes_read, portMAX_DELAY) == ESP_OK) {
+                // A sua lógica exata de extração de 16 bits que funcionou perfeitamente
+                int16_t sample_16 = (int16_t)(sample >> 16); 
+                uart_write_bytes(UART_NUM_0, (const char*)&sample_16, sizeof(sample_16));
+            }
+        }
+        
+        ESP_LOGI(TAG, "Captura finalizada.");
+
+        // Desliga o microfone para evitar drenagem de bateria durante o sono
+        i2s_channel_disable(rx_chan);
+        i2s_del_channel(rx_chan);
+        
+    } else {
+        ESP_LOGI(TAG, "Inicialização padrão. Preparando para dormir...");
+    }
+
+    // 2. Configura o botão para o próximo Deep Sleep
+    ESP_LOGI(TAG, "Entrando em Deep Sleep. Zzz...");
+    
+    // Configura o pino 33 para acordar o ESP32 quando conectado ao GND (LOW)
+    esp_sleep_enable_ext0_wakeup(BUTTON_GPIO, 0);
+    
+    // Habilita o resistor interno para impedir que o pino atue como antena e acorde sozinho
+    rtc_gpio_pullup_en(BUTTON_GPIO);
+    rtc_gpio_pulldown_dis(BUTTON_GPIO);
+
+    // Dá um tempo para as mensagens do LOG serem impressas na tela antes de desligar
+    vTaskDelay(pdMS_TO_TICKS(100)); 
+    esp_deep_sleep_start();
+}
