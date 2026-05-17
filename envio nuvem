@@ -1,0 +1,102 @@
+import serial
+import wave
+import os
+import boto3  # <--- Nova biblioteca
+from datetime import datetime
+from botocore.exceptions import NoCredentialsError
+
+# --- CONFIGURAÇÕES ---
+COM_PORT = 'COM4'         # Ajustado para Windows (ex: COM3)
+BAUD_RATE = 921600         
+SAMPLE_RATE = 20000        
+DURATION = 4               
+
+# --- CONFIGURAÇÕES AWS ---
+S3_BUCKET_NAME = "seu-nome-de-bucket-aqui"
+# Se as credenciais não estiverem no PC, você pode passar aqui (não recomendado para produção)
+# s3 = boto3.client('s3', aws_access_key_id='...', aws_secret_access_key='...')
+s3 = boto3.client('s3')
+
+# Pasta local
+SAVE_DIR = os.path.join(os.path.expanduser("~"), "Gravacoes_Pets")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+def upload_to_s3(file_path, file_name):
+    """Função auxiliar para enviar o arquivo para o S3"""
+    try:
+        print(f"    ☁️  Enviando {file_name} para o S3...")
+        # Opcional: organizar por data dentro do bucket usando prefixos (pastas virtuais)
+        s3_path = f"audios_capturados/{file_name}"
+        s3.upload_file(file_path, S3_BUCKET_NAME, s3_path)
+        print(f"    ✅ Upload realizado com sucesso no bucket {S3_BUCKET_NAME}")
+    except FileNotFoundError:
+        print("    ❌ Erro: Arquivo local não encontrado.")
+    except NoCredentialsError:
+        print("    ❌ Erro: Credenciais AWS não configuradas.")
+    except Exception as e:
+        print(f"    ❌ Erro no upload: {e}")
+
+def record_continuously():
+    print(f"Abrindo porta {COM_PORT}...")
+    try:
+        ser = serial.Serial(COM_PORT, BAUD_RATE, timeout=1) 
+    except Exception as e:
+        print(f"Erro: {e}\nVERIFIQUE: O monitor serial da IDE está fechado?")
+        return
+
+    print("\n" + "="*60)
+    print(f"▶ MODO DE GRAVAÇÃO E CLOUD ATIVADO")
+    print(f"▶ Local: {SAVE_DIR} | Cloud: {S3_BUCKET_NAME}")
+    print("="*60 + "\n")
+
+    contador = 1
+    target_marker = b"===START_AUDIO=="
+
+    while True:
+        print(f"[{contador}] Aguardando o aperto do botão no ESP32...")
+        sync_buffer = b""
+        
+        while True:
+            try:
+                char = ser.read(1)
+                if not char: continue
+                sync_buffer += char
+                if target_marker in sync_buffer:
+                    print("    Sinal recebido! Gravando 4 segundos...")
+                    break
+                if len(sync_buffer) > 50: sync_buffer = sync_buffer[-30:]
+            except KeyboardInterrupt:
+                ser.close()
+                return
+            except: pass 
+
+        # 2. Captura os dados
+        total_bytes = DURATION * SAMPLE_RATE * 2
+        ser.timeout = DURATION + 2 
+        raw_data = ser.read(total_bytes)
+        
+        # 3. Gera nome único
+        agora = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        nome_arquivo = f"pet_audio_{agora}.wav"
+        caminho_completo = os.path.join(SAVE_DIR, nome_arquivo)
+
+        # 4. Salva o arquivo WAV localmente
+        with wave.open(caminho_completo, 'w') as wav_file:
+            wav_file.setnchannels(1)           
+            wav_file.setsampwidth(2)           
+            wav_file.setframerate(SAMPLE_RATE) 
+            wav_file.writeframes(raw_data)
+        
+        print(f"    💾 Salvo localmente: {nome_arquivo}")
+
+        # 5. --- INTEGRAÇÃO AWS: ENVIO PARA O S3 ---
+        upload_to_s3(caminho_completo, nome_arquivo)
+        
+        contador += 1
+        ser.reset_input_buffer()
+
+if __name__ == "__main__":
+    try:
+        record_continuously()
+    except KeyboardInterrupt:
+        print("\nScript encerrado pelo usuário.")
